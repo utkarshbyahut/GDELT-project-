@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-Chunked, polite GDELT county–date–disaster crawler (location: operator, no pandas).
+Chunked, adaptive, polite GDELT county–date–disaster crawler
+- Uses location:"<County>, <State>, US" and theme:... filters (accurate + low-noise)
+- Global rate limiter with adaptive slow-down on repeated 429s
+- Global cool-off across the whole process after any 429
+- Chunked processing with cooldowns between chunks
+- Resumable via CSV log
+- No pandas; lightweight csv parsing
 
 Output (NDJSON per line):
   {"state": "...", "county": "...", "date": "YYYY-MM-DD", "disaster": "...",
    "articles": [{"title": "...", "url": "...", "source": "..."}]}
-
-Changes vs prior version:
-- Uses GDELT location operator: location:"<County>, <State>, US"
-- Polite but faster: ~12 RPM (1 request/5s) with exponential backoff + jitter
-- Removes pandas; uses csv + defaultdict for grouping
-- Keeps absolute COUNTIES_CSV path as provided
-- Chunked processing + cooldown; resume via CSV log
 """
 
 import csv
@@ -38,33 +37,66 @@ LOG_CSV      = "gdelt_query_log.csv"
 # ---------------- knobs ----------------
 DISASTERS = ["hurricane", "flood", "tornado", "wildfire", "earthquake", "drought", "storm"]
 
-MAX_RECORDS        = 250          # API max
-RATE_LIMIT_RPM     = 8         # ~1 request every 5 seconds
+# Map each disaster to one or more GKG theme tokens (used via DOC API theme: operator)
+DISASTER_THEMES = {
+    "flood":      ["NATURAL_DISASTER_FLOOD", "FLOOD"],
+    "wildfire":   ["WILDFIRE", "FIRE_WILDFIRE"],
+    "drought":    ["DROUGHT", "ENV_DROUGHT"],
+    "earthquake": ["EARTHQUAKE"],
+    "hurricane":  ["HURRICANE", "TROPICAL_CYCLONE", "TYPHOON"],
+    "tornado":    ["TORNADO"],
+    "storm":      ["STORM", "SEVERE_WEATHER"],
+}
+
+MAX_RECORDS        = 250
+RATE_LIMIT_RPM     = 9            # CHANGED: baseline ~6.7s/req, but see MIN_API_INTERVAL floor below
 RETRIES            = 8
 TIMEOUT            = 30
 SLEEP_BASE         = 1.5
-BACKOFF_MAX        = 120.0
-QUERY_SCOPE        = "sourcecountry:US timespan:180d"  # start with 6 months; widen later if needed
+BACKOFF_MAX        = 180.0
+QUERY_SCOPE        = "sourcecountry:US timespan:30d"   # CHANGED: start tight; widen in later passes
 
-CHUNK_SIZE         = 80           # keys per chunk
-CHUNK_COOLDOWN_SEC = 180          # 3 min between chunks (polite)
-MAX_CHUNKS_PER_RUN = None         # e.g., 10 to cap a run; None = all
+CHUNK_SIZE         = 20           # CHANGED: smaller bursts
+CHUNK_COOLDOWN_SEC = 300          # CHANGED: 5 minutes between chunks
+MAX_CHUNKS_PER_RUN = None
 
-SLEEP_BETWEEN_KEYS = 0.0          # pacing handled by global limiter
-RANDOMIZE_KEYS     = True         # spread load across geography/disasters
+SLEEP_BETWEEN_KEYS = 0.0
+RANDOMIZE_KEYS     = True
 
-USER_AGENT         = "Utkarsh-GDELT-Research-Crawler/2.0 (+local use)"
+# ---- hard minimum per API guidance (≥ 1 request every ~5 seconds) ----
+MIN_API_INTERVAL   = 5.5          # CHANGED: floor gap between requests
 
-# ---------------- rate limiter ----------------
+# Startup warm-up to avoid rolling-window throttles after restarts
+STARTUP_WARMUP_SEC = 600          # CHANGED: 10 minutes before first call
+
+# Randomized UA each run to avoid exact fingerprinting
+BASE_USER_AGENT    = "Utkarsh-GDELT-Research-Crawler/3.1"
+
+# ---------------- global rate/429 state ----------------
 _min_interval = 60.0 / max(RATE_LIMIT_RPM, 1)
 _last_request_ts = 0.0
 
+_last_429_ts = 0.0
+GLOBAL_429_COOLDOWN = 300.0
+
+_adaptive_factor = 1.0
+ADAPTIVE_MAX_FACTOR = 4.0
+ADAPTIVE_DECAY_SEC = 600.0
+_last_adapt_ts = 0.0
+
 def rate_limit_sleep():
-    global _last_request_ts
+    """Global limiter: enforces MIN_API_INTERVAL floor + adaptive slow-down."""
+    global _last_request_ts, _adaptive_factor, _last_adapt_ts
+    # decay adaptive factor
+    if _adaptive_factor > 1.0 and (time.monotonic() - _last_adapt_ts) > ADAPTIVE_DECAY_SEC:
+        _adaptive_factor = max(1.0, _adaptive_factor * 0.8)
+        _last_adapt_ts = time.monotonic()
+
     now = time.monotonic()
-    wait = _min_interval - (now - _last_request_ts)
-    # small jitter to avoid lockstep patterns
-    wait = max(0.0, wait) + random.uniform(0.05, 0.25)
+    base_interval = 60.0 / max(RATE_LIMIT_RPM, 1)
+    interval = max(MIN_API_INTERVAL, base_interval) * _adaptive_factor  # CHANGED: enforce floor
+    wait = interval - (now - _last_request_ts)
+    wait = max(0.0, wait) + random.uniform(0.05, 0.25)                  # small jitter
     if wait > 0:
         time.sleep(wait)
     _last_request_ts = time.monotonic()
@@ -81,14 +113,14 @@ def make_session() -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retry)
     sess.mount("https://", adapter)
-    sess.headers.update({"User-Agent": USER_AGENT})
+    # CHANGED: randomized UA per run
+    sess.headers.update({"User-Agent": f"{BASE_USER_AGENT} ({random.randint(1000,9999)})"})
     return sess
 
 SESSION = make_session()
 
 # ---------------- utils ----------------
 def chunked(iterable: Iterable, size: int):
-    """Yield items in fixed-size chunks."""
     buf = []
     for item in iterable:
         buf.append(item)
@@ -98,15 +130,35 @@ def chunked(iterable: Iterable, size: int):
     if buf:
         yield buf
 
+def disaster_theme_clause(disaster: str) -> str:
+    themes = DISASTER_THEMES.get(disaster, [])
+    if not themes:
+        return disaster
+    ors = " OR ".join(f'theme:{t}' for t in themes)
+    return f"({ors})"
+
 def county_query_string(county_name_clean: str, state_name: str) -> str:
     """
-    Use GDELT location operator to filter on structured geocoding.
-    Example: location:"Maricopa County, Arizona, US"
+    Use GDELT location operator; add common suffixes when missing.
     """
-    return f'location:"{county_name_clean}, {state_name}, US"'
+    c = county_name_clean.strip()
+    lc = c.lower()
+    st_lc = state_name.strip().lower()
+
+    if "parish" in lc:
+        label = c
+    elif "city and borough" in lc or lc.endswith(" city") or lc == "city":
+        label = c
+    elif "borough" in lc or "census area" in lc:
+        label = c
+    elif st_lc in ("district of columbia", "washington, d.c.", "dc", "d.c."):
+        label = c
+    else:
+        label = c if lc.endswith(" county") else f"{c} County"
+
+    return f'location:"{label}, {state_name}, US"'
 
 def gdelt_url(query: str) -> str:
-    # Include scope (US, time window) in the query
     q = f"{query} {QUERY_SCOPE}".strip()
     return (
         "https://api.gdeltproject.org/api/v2/doc/doc"
@@ -114,9 +166,6 @@ def gdelt_url(query: str) -> str:
     )
 
 def normalize_date(val) -> str:
-    """
-    GDELT 'Date' is YYYYMMDDHHMMSS. Keep YYYY-MM-DD.
-    """
     if val is None:
         return ""
     s = str(val)
@@ -128,10 +177,6 @@ def normalize_date(val) -> str:
 
 # ---------------- parsing & grouping (no pandas) ----------------
 def rows_from_csv_text(csv_text: str, state: str, county: str, disaster: str) -> List[Dict]:
-    """
-    Parse the DOC API CSV text and return grouped rows:
-    [{state, county, date, disaster, articles:[{title,url,source}, ...]}, ...]
-    """
     if not csv_text or "DocumentIdentifier" not in csv_text:
         return []
 
@@ -140,7 +185,7 @@ def rows_from_csv_text(csv_text: str, state: str, county: str, disaster: str) ->
     by_date: Dict[str, List[Dict]] = defaultdict(list)
 
     for row in reader:
-        url = row.get("DocumentIdentifier") or ""
+        url = (row.get("DocumentIdentifier") or "").strip()
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
@@ -151,7 +196,6 @@ def rows_from_csv_text(csv_text: str, state: str, county: str, disaster: str) ->
 
         title = row.get("Title") or ""
         source = row.get("SourceCommonName") or ""
-        # quick hostname fallback if SourceCommonName is empty
         if not source:
             m = re.search(r"https?://([^/]+)", url)
             if m:
@@ -170,7 +214,6 @@ def rows_from_csv_text(csv_text: str, state: str, county: str, disaster: str) ->
                 "articles": arts,
             })
 
-    # keep newest first (matches sort=datedesc)
     out.sort(key=lambda r: r["date"], reverse=True)
     return out
 
@@ -192,9 +235,6 @@ def log_progress(path: str, state: str, county: str, disaster: str, n_dates: int
         w.writerow([state, county, disaster, n_dates, n_articles])
 
 def load_done_keys(log_csv: str) -> set:
-    """
-    Read already-processed (state, county, disaster) triplets from a tolerant CSV.
-    """
     done = set()
     p = Path(log_csv)
     if not p.exists() or p.stat().st_size == 0:
@@ -203,7 +243,6 @@ def load_done_keys(log_csv: str) -> set:
         rd = csv.DictReader(f)
         if not rd.fieldnames:
             return done
-        # strip whitespace & lowercase header names
         lower = {h.strip().lower(): h for h in rd.fieldnames}
         s, c, d = lower.get("state"), lower.get("county"), lower.get("disaster")
         if not (s and c and d):
@@ -217,13 +256,9 @@ def load_done_keys(log_csv: str) -> set:
     return done
 
 def load_counties(path: str) -> List[Tuple[str, str]]:
-    """
-    Expect columns: state_name, county_name_clean
-    """
     rows: List[Tuple[str, str]] = []
     with open(path, newline="", encoding="utf-8") as f:
         rd = csv.DictReader(f)
-        # tolerate header variants
         lower = {h.strip().lower(): h for h in (rd.fieldnames or [])}
         s_col = lower.get("state_name") or lower.get("state")
         c_col = lower.get("county_name_clean") or lower.get("countyclean") or lower.get("county")
@@ -236,27 +271,47 @@ def load_counties(path: str) -> List[Tuple[str, str]]:
                 rows.append((s, c))
     return rows
 
-# ---------------- fetch with 429 handling ----------------
+# ---------------- fetch with global 429 handling ----------------
 def fetch_gdelt(query: str) -> str:
     """
     Return the raw CSV string from the DOC API for a given query.
+    Adds:
+      - global cool-off if any earlier request saw a 429
+      - adaptive throttle bumps on 429
     """
+    global _last_429_ts, _adaptive_factor, _last_adapt_ts
+
     url = gdelt_url(query)
     backoff = SLEEP_BASE
     last_err = None
     streak_429 = 0
 
     for attempt in range(1, RETRIES + 1):
+        # global RPM limiter
         rate_limit_sleep()
+
+        # if we recently saw a 429 anywhere, honor a global cool-off
+        since = time.monotonic() - _last_429_ts
+        if since < GLOBAL_429_COOLDOWN:
+            sleep_s = GLOBAL_429_COOLDOWN - since + random.uniform(0.1, 0.5)
+            print(f"[rate] global cool-off active. sleeping {sleep_s:.1f}s")
+            time.sleep(sleep_s)
+
         try:
             r = SESSION.get(url, timeout=TIMEOUT)
             txt = r.text or ""
 
             if r.status_code == 200 and "DocumentIdentifier" in txt and len(txt) > 100:
+                time.sleep(2.0)  # CHANGED: tiny success delay to avoid edge hits
                 return txt
 
             if r.status_code == 429:
+                _last_429_ts = time.monotonic()
                 streak_429 += 1
+
+                _adaptive_factor = min(ADAPTIVE_MAX_FACTOR, _adaptive_factor * 1.25)
+                _last_adapt_ts = time.monotonic()
+
                 ra = r.headers.get("Retry-After")
                 try:
                     sleep_s = float(ra) if ra else backoff + random.uniform(0, 0.5)
@@ -265,8 +320,9 @@ def fetch_gdelt(query: str) -> str:
                 print(f"[rate] 429 attempt {attempt}. sleeping {sleep_s:.1f}s")
                 time.sleep(sleep_s)
                 backoff = min(backoff * 2, BACKOFF_MAX)
+
                 if streak_429 >= 3:
-                    cool = 180 + random.uniform(0, 60)  # extra cool-down
+                    cool = 300 + random.uniform(0, 60)
                     print(f"[rate] 429 streak={streak_429}. cooling {cool:.1f}s")
                     time.sleep(cool)
                     streak_429 = 0
@@ -318,6 +374,11 @@ def main():
 
     print(f"pending keys to process: {len(pending)}")
 
+    # CHANGED: startup warm-up to avoid rolling-window 429 after restart
+    if pending:
+        print(f"[start] warm-up sleep {STARTUP_WARMUP_SEC}s to avoid rolling-window 429…")
+        time.sleep(STARTUP_WARMUP_SEC)
+
     chunks_iter = list(chunked(pending, CHUNK_SIZE))
     if MAX_CHUNKS_PER_RUN is not None:
         chunks_iter = chunks_iter[:MAX_CHUNKS_PER_RUN]
@@ -331,9 +392,9 @@ def main():
             if not _running:
                 break
 
-            # location filter + disaster keyword (accurate targeting)
             loc_query = county_query_string(county_clean, state)
-            q = f"{disaster} {loc_query}"
+            disaster_clause = disaster_theme_clause(disaster)
+            q = f"{disaster_clause} {loc_query}"
 
             csv_text = fetch_gdelt(q)
             entries = rows_from_csv_text(csv_text, state=state, county=county_clean, disaster=disaster)
